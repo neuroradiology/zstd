@@ -1,74 +1,90 @@
-# ##########################################################################
-# ZSTD educational examples - Makefile
-# Copyright (C) Yann Collet 2016
+# ################################################################
+# Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
+# All rights reserved.
 #
-# GPL v2 License
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-#
-# You can contact the author at :
-#  - zstd homepage : http://www.zstd.net/
-# ##########################################################################
+# This source code is licensed under both the BSD-style license (found in the
+# LICENSE file in the root directory of this source tree) and the GPLv2 (found
+# in the COPYING file in the root directory of this source tree).
+# ################################################################
 
 # This Makefile presumes libzstd is installed, using `sudo make install`
 
-LDFLAGS+= -lzstd
+CPPFLAGS += -I../lib
+LIB = ../lib/libzstd.a
 
 .PHONY: default all clean test
 
 default: all
 
 all: simple_compression simple_decompression \
+	multiple_simple_compression\
 	dictionary_compression dictionary_decompression \
-	streaming_compression streaming_decompression
+	streaming_compression streaming_decompression \
+	multiple_streaming_compression streaming_memory_usage
 
-simple_compression : simple_compression.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
+$(LIB) :
+	$(MAKE) -C ../lib libzstd.a
 
-simple_decompression : simple_decompression.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
+simple_compression : simple_compression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
-dictionary_compression : dictionary_compression.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
+simple_decompression : simple_decompression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
-dictionary_decompression : dictionary_decompression.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
+multiple_simple_compression : multiple_simple_compression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
-streaming_compression : streaming_compression.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
+dictionary_compression : dictionary_compression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
-streaming_decompression : streaming_decompression.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ $(LDFLAGS) -o $@
+dictionary_decompression : dictionary_decompression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+streaming_compression : streaming_compression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+multiple_streaming_compression : multiple_streaming_compression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+streaming_decompression : streaming_decompression.c common.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+streaming_memory_usage : streaming_memory_usage.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 clean:
 	@rm -f core *.o tmp* result* *.zst \
         simple_compression simple_decompression \
-		dictionary_compression dictionary_decompression \
-		streaming_compression streaming_decompression
+        multiple_simple_compression \
+        dictionary_compression dictionary_decompression \
+        streaming_compression streaming_decompression \
+        multiple_streaming_compression streaming_memory_usage
 	@echo Cleaning completed
 
 test: all
 	cp README.md tmp
-	@echo starting simple compression
+	cp Makefile tmp2
+	@echo -- Simple compression tests
 	./simple_compression tmp
 	./simple_decompression tmp.zst
-	./streaming_decompression tmp.zst
-	@echo starting streaming compression
+	./multiple_simple_compression *.c
+	./streaming_decompression tmp.zst > /dev/null
+	@echo -- Streaming memory usage
+	./streaming_memory_usage
+	@echo -- Streaming compression tests
 	./streaming_compression tmp
-	./streaming_decompression tmp.zst
-	@echo starting dictionary compression
-	./dictionary_compression tmp README.md
-	./dictionary_decompression tmp.zst README.md
+	./streaming_decompression tmp.zst > /dev/null
+	@echo -- Edge cases detection
+	! ./streaming_decompression tmp    # invalid input, must fail
+	! ./simple_decompression tmp       # invalid input, must fail
+	! ./simple_decompression tmp.zst   # unknown input size, must fail
+	touch tmpNull                      # create 0-size file
+	./simple_compression tmpNull
+	./simple_decompression tmpNull.zst # 0-size frame : must work
+	@echo -- Multiple streaming tests
+	./multiple_streaming_compression *.c
+	@echo -- Dictionary compression tests
+	./dictionary_compression tmp2 tmp README.md
+	./dictionary_decompression tmp2.zst tmp.zst README.md
+	$(RM) tmp* *.zst
 	@echo tests completed

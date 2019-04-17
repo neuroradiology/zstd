@@ -1,42 +1,24 @@
-/**
+/*
  * Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
  * All rights reserved.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under both the BSD-style license (found in the
+ * LICENSE file in the root directory of this source tree) and the GPLv2 (found
+ * in the COPYING file in the root directory of this source tree).
+ * You may select, at your option, one of the above-listed licenses.
  */
 
 
 
-/* *************************************
-*  Compiler Options
-***************************************/
-#if defined(_MSC_VER)
-#  define _CRT_SECURE_NO_WARNINGS    /* removes Visual warning on strerror() */
-#  define _CRT_SECURE_NO_DEPRECATE   /* removes VS2005 warning on strerror() */
-#endif
-
 /*-************************************
 *  Dependencies
 **************************************/
-#include <stdlib.h>    /* malloc */
+#include "datagen.h"
+#include "platform.h"  /* SET_BINARY_MODE */
+#include <stdlib.h>    /* malloc, free */
 #include <stdio.h>     /* FILE, fwrite, fprintf */
 #include <string.h>    /* memcpy */
-#include <errno.h>     /* errno */
 #include "mem.h"       /* U32 */
-
-
-/*-************************************
-*  OS-specific Includes
-**************************************/
-#if defined(MSDOS) || defined(OS2) || defined(WIN32) || defined(_WIN32) || defined(__CYGWIN__)
-#  include <fcntl.h>   /* _O_BINARY */
-#  include <io.h>      /* _setmode, _isatty */
-#  define SET_BINARY_MODE(file) {int unused = _setmode(_fileno(file), _O_BINARY); (void)unused; }
-#else
-#  define SET_BINARY_MODE(file)
-#endif
 
 
 /*-************************************
@@ -99,18 +81,18 @@ static BYTE RDG_genChar(U32* seed, const BYTE* ldt)
 }
 
 
-static U32 RDG_rand15Bits (unsigned* seedPtr)
+static U32 RDG_rand15Bits (U32* seedPtr)
 {
     return RDG_rand(seedPtr) & 0x7FFF;
 }
 
-static U32 RDG_randLength(unsigned* seedPtr)
+static U32 RDG_randLength(U32* seedPtr)
 {
     if (RDG_rand(seedPtr) & 7) return (RDG_rand(seedPtr) & 0xF);   /* small length */
     return (RDG_rand(seedPtr) & 0x1FF) + 0xF;
 }
 
-void RDG_genBlock(void* buffer, size_t buffSize, size_t prefixSize, double matchProba, const BYTE* ldt, unsigned* seedPtr)
+static void RDG_genBlock(void* buffer, size_t buffSize, size_t prefixSize, double matchProba, const BYTE* ldt, U32* seedPtr)
 {
     BYTE* const buffPtr = (BYTE*)buffer;
     U32 const matchProba32 = (U32)(32768 * matchProba);
@@ -159,16 +141,18 @@ void RDG_genBlock(void* buffer, size_t buffSize, size_t prefixSize, double match
 
 void RDG_genBuffer(void* buffer, size_t size, double matchProba, double litProba, unsigned seed)
 {
+    U32 seed32 = seed;
     BYTE ldt[LTSIZE];
     memset(ldt, '0', sizeof(ldt));  /* yes, character '0', this is intentional */
     if (litProba<=0.0) litProba = matchProba / 4.5;
     RDG_fillLiteralDistrib(ldt, litProba);
-    RDG_genBlock(buffer, size, 0, matchProba, ldt, &seed);
+    RDG_genBlock(buffer, size, 0, matchProba, ldt, &seed32);
 }
 
 
 void RDG_genStdout(unsigned long long size, double matchProba, double litProba, unsigned seed)
 {
+    U32 seed32 = seed;
     size_t const stdBlockSize = 128 KB;
     size_t const stdDictSize = 32 KB;
     BYTE* const buff = (BYTE*)malloc(stdDictSize + stdBlockSize);
@@ -176,19 +160,19 @@ void RDG_genStdout(unsigned long long size, double matchProba, double litProba, 
     BYTE ldt[LTSIZE];   /* literals distribution table */
 
     /* init */
-    if (buff==NULL) { fprintf(stderr, "datagen: error: %s \n", strerror(errno)); exit(1); }
+    if (buff==NULL) { perror("datagen"); exit(1); }
     if (litProba<=0.0) litProba = matchProba / 4.5;
     memset(ldt, '0', sizeof(ldt));   /* yes, character '0', this is intentional */
     RDG_fillLiteralDistrib(ldt, litProba);
     SET_BINARY_MODE(stdout);
 
     /* Generate initial dict */
-    RDG_genBlock(buff, stdDictSize, 0, matchProba, ldt, &seed);
+    RDG_genBlock(buff, stdDictSize, 0, matchProba, ldt, &seed32);
 
     /* Generate compressible data */
     while (total < size) {
         size_t const genBlockSize = (size_t) (MIN (stdBlockSize, size-total));
-        RDG_genBlock(buff, stdDictSize+stdBlockSize, stdDictSize, matchProba, ldt, &seed);
+        RDG_genBlock(buff, stdDictSize+stdBlockSize, stdDictSize, matchProba, ldt, &seed32);
         total += genBlockSize;
         { size_t const unused = fwrite(buff, 1, genBlockSize, stdout); (void)unused; }
         /* update dict */

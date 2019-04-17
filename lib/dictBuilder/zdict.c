@@ -1,18 +1,20 @@
-/**
+/*
  * Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
  * All rights reserved.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under both the BSD-style license (found in the
+ * LICENSE file in the root directory of this source tree) and the GPLv2 (found
+ * in the COPYING file in the root directory of this source tree).
+ * You may select, at your option, one of the above-listed licenses.
  */
 
 
 /*-**************************************
 *  Tuning parameters
 ****************************************/
+#define MINRATIO 4   /* minimum nb of apparition to be selected in dictionary */
 #define ZDICT_MAX_SAMPLES_SIZE (2000U << 20)
-#define ZDICT_MIN_SAMPLES_SIZE 512
+#define ZDICT_MIN_SAMPLES_SIZE (ZDICT_CONTENTSIZE_MIN * MINRATIO)
 
 
 /*-**************************************
@@ -36,12 +38,11 @@
 #include <time.h>          /* clock */
 
 #include "mem.h"           /* read */
-#include "error_private.h"
 #include "fse.h"           /* FSE_normalizeCount, FSE_writeNCount */
 #define HUF_STATIC_LINKING_ONLY
-#include "huf.h"
+#include "huf.h"           /* HUF_buildCTable, HUF_writeCTable */
 #include "zstd_internal.h" /* includes zstd.h */
-#include "xxhash.h"
+#include "xxhash.h"        /* XXH64 */
 #include "divsufsort.h"
 #ifndef ZDICT_STATIC_LINKING_ONLY
 #  define ZDICT_STATIC_LINKING_ONLY
@@ -60,37 +61,26 @@
 
 #define NOISELENGTH 32
 
-#define MINRATIO 4
-static const int g_compressionLevel_default = 5;
+static const int g_compressionLevel_default = 3;
 static const U32 g_selectivity_default = 9;
-static const size_t g_provision_entropySize = 200;
-static const size_t g_min_fast_dictContent = 192;
 
 
 /*-*************************************
 *  Console display
 ***************************************/
 #define DISPLAY(...)         { fprintf(stderr, __VA_ARGS__); fflush( stderr ); }
-#define DISPLAYLEVEL(l, ...) if (g_displayLevel>=l) { DISPLAY(__VA_ARGS__); }
-static unsigned g_displayLevel = 0;   /* 0 : no display;   1: errors;   2: default;  4: full information */
-
-#define DISPLAYUPDATE(l, ...) if (g_displayLevel>=l) { \
-            if (ZDICT_clockSpan(g_time) > refreshRate)  \
-            { g_time = clock(); DISPLAY(__VA_ARGS__); \
-            if (g_displayLevel>=4) fflush(stdout); } }
-static const clock_t refreshRate = CLOCKS_PER_SEC * 3 / 10;
-static clock_t g_time = 0;
+#define DISPLAYLEVEL(l, ...) if (notificationLevel>=l) { DISPLAY(__VA_ARGS__); }    /* 0 : no display;   1: errors;   2: default;  3: details;  4: debug */
 
 static clock_t ZDICT_clockSpan(clock_t nPrevious) { return clock() - nPrevious; }
 
-static void ZDICT_printHex(U32 dlevel, const void* ptr, size_t length)
+static void ZDICT_printHex(const void* ptr, size_t length)
 {
     const BYTE* const b = (const BYTE*)ptr;
     size_t u;
     for (u=0; u<length; u++) {
         BYTE c = b[u];
         if (c<32 || c>126) c = '.';   /* non-printable char */
-        DISPLAYLEVEL(dlevel, "%c", c);
+        DISPLAY("%c", c);
     }
 }
 
@@ -105,7 +95,7 @@ const char* ZDICT_getErrorName(size_t errorCode) { return ERR_getErrorName(error
 unsigned ZDICT_getDictID(const void* dictBuffer, size_t dictSize)
 {
     if (dictSize < 8) return 0;
-    if (MEM_readLE32(dictBuffer) != ZSTD_DICT_MAGIC) return 0;
+    if (MEM_readLE32(dictBuffer) != ZSTD_MAGIC_DICTIONARY) return 0;
     return MEM_readLE32((const char*)dictBuffer + 4);
 }
 
@@ -113,7 +103,7 @@ unsigned ZDICT_getDictID(const void* dictBuffer, size_t dictSize)
 /*-********************************************************
 *  Dictionary training functions
 **********************************************************/
-static unsigned ZDICT_NbCommonBytes (register size_t val)
+static unsigned ZDICT_NbCommonBytes (size_t val)
 {
     if (MEM_isLittleEndian()) {
         if (MEM_64bits()) {
@@ -211,13 +201,12 @@ static void ZDICT_initDictItem(dictItem* d)
 static dictItem ZDICT_analyzePos(
                        BYTE* doneMarks,
                        const int* suffix, U32 start,
-                       const void* buffer, U32 minRatio)
+                       const void* buffer, U32 minRatio, U32 notificationLevel)
 {
     U32 lengthList[LLIMIT] = {0};
     U32 cumulLength[LLIMIT] = {0};
     U32 savings[LLIMIT] = {0};
     const BYTE* b = (const BYTE*)buffer;
-    size_t length;
     size_t maxLength = LLIMIT;
     size_t pos = suffix[start];
     U32 end = start;
@@ -232,26 +221,30 @@ static dictItem ZDICT_analyzePos(
        ||(MEM_read16(b+pos+1) == MEM_read16(b+pos+3))
        ||(MEM_read16(b+pos+2) == MEM_read16(b+pos+4)) ) {
         /* skip and mark segment */
-        U16 u16 = MEM_read16(b+pos+4);
-        U32 u, e = 6;
-        while (MEM_read16(b+pos+e) == u16) e+=2 ;
-        if (b[pos+e] == b[pos+e-1]) e++;
-        for (u=1; u<e; u++)
+        U16 const pattern16 = MEM_read16(b+pos+4);
+        U32 u, patternEnd = 6;
+        while (MEM_read16(b+pos+patternEnd) == pattern16) patternEnd+=2 ;
+        if (b[pos+patternEnd] == b[pos+patternEnd-1]) patternEnd++;
+        for (u=1; u<patternEnd; u++)
             doneMarks[pos+u] = 1;
         return solution;
     }
 
     /* look forward */
-    do {
-        end++;
-        length = ZDICT_count(b + pos, b + suffix[end]);
-    } while (length >=MINMATCHLENGTH);
+    {   size_t length;
+        do {
+            end++;
+            length = ZDICT_count(b + pos, b + suffix[end]);
+        } while (length >= MINMATCHLENGTH);
+    }
 
     /* look backward */
-    do {
-        length = ZDICT_count(b + pos, b + *(suffix+start-1));
-        if (length >=MINMATCHLENGTH) start--;
-    } while(length >= MINMATCHLENGTH);
+    {   size_t length;
+        do {
+            length = ZDICT_count(b + pos, b + *(suffix+start-1));
+            if (length >=MINMATCHLENGTH) start--;
+        } while(length >= MINMATCHLENGTH);
+    }
 
     /* exit if not found a minimum nb of repetitions */
     if (end-start < minRatio) {
@@ -262,15 +255,15 @@ static dictItem ZDICT_analyzePos(
     }
 
     {   int i;
-        U32 searchLength;
+        U32 mml;
         U32 refinedStart = start;
         U32 refinedEnd = end;
 
         DISPLAYLEVEL(4, "\n");
-        DISPLAYLEVEL(4, "found %3u matches of length >= %i at pos %7u  ", (U32)(end-start), MINMATCHLENGTH, (U32)pos);
+        DISPLAYLEVEL(4, "found %3u matches of length >= %i at pos %7u  ", (unsigned)(end-start), MINMATCHLENGTH, (unsigned)pos);
         DISPLAYLEVEL(4, "\n");
 
-        for (searchLength = MINMATCHLENGTH ; ; searchLength++) {
+        for (mml = MINMATCHLENGTH ; ; mml++) {
             BYTE currentChar = 0;
             U32 currentCount = 0;
             U32 currentID = refinedStart;
@@ -278,13 +271,13 @@ static dictItem ZDICT_analyzePos(
             U32 selectedCount = 0;
             U32 selectedID = currentID;
             for (id =refinedStart; id < refinedEnd; id++) {
-                if (b[ suffix[id] + searchLength] != currentChar) {
+                if (b[suffix[id] + mml] != currentChar) {
                     if (currentCount > selectedCount) {
                         selectedCount = currentCount;
                         selectedID = currentID;
                     }
                     currentID = id;
-                    currentChar = b[ suffix[id] + searchLength];
+                    currentChar = b[ suffix[id] + mml];
                     currentCount = 0;
                 }
                 currentCount ++;
@@ -300,28 +293,31 @@ static dictItem ZDICT_analyzePos(
             refinedEnd = refinedStart + selectedCount;
         }
 
-        /* evaluate gain based on new ref */
+        /* evaluate gain based on new dict */
         start = refinedStart;
         pos = suffix[refinedStart];
         end = start;
         memset(lengthList, 0, sizeof(lengthList));
 
         /* look forward */
-        do {
-            end++;
-            length = ZDICT_count(b + pos, b + suffix[end]);
-            if (length >= LLIMIT) length = LLIMIT-1;
-            lengthList[length]++;
-        } while (length >=MINMATCHLENGTH);
+        {   size_t length;
+            do {
+                end++;
+                length = ZDICT_count(b + pos, b + suffix[end]);
+                if (length >= LLIMIT) length = LLIMIT-1;
+                lengthList[length]++;
+            } while (length >=MINMATCHLENGTH);
+        }
 
         /* look backward */
-		length = MINMATCHLENGTH;
-		while ((length >= MINMATCHLENGTH) & (start > 0)) {
-			length = ZDICT_count(b + pos, b + suffix[start - 1]);
-			if (length >= LLIMIT) length = LLIMIT - 1;
-			lengthList[length]++;
-			if (length >= MINMATCHLENGTH) start--;
-		}
+        {   size_t length = MINMATCHLENGTH;
+            while ((length >= MINMATCHLENGTH) & (start > 0)) {
+                length = ZDICT_count(b + pos, b + suffix[start - 1]);
+                if (length >= LLIMIT) length = LLIMIT - 1;
+                lengthList[length]++;
+                if (length >= MINMATCHLENGTH) start--;
+            }
+        }
 
         /* largest useful length */
         memset(cumulLength, 0, sizeof(cumulLength));
@@ -345,8 +341,8 @@ static dictItem ZDICT_analyzePos(
         for (i=MINMATCHLENGTH; i<=(int)maxLength; i++)
             savings[i] = savings[i-1] + (lengthList[i] * (i-3));
 
-        DISPLAYLEVEL(4, "Selected ref at position %u, of length %u : saves %u (ratio: %.2f)  \n",
-                     (U32)pos, (U32)maxLength, savings[maxLength], (double)savings[maxLength] / maxLength);
+        DISPLAYLEVEL(4, "Selected dict at position %u, of length %u : saves %u (ratio: %.2f)  \n",
+                     (unsigned)pos, (unsigned)maxLength, (unsigned)savings[maxLength], (double)savings[maxLength] / maxLength);
 
         solution.pos = (U32)pos;
         solution.length = (U32)maxLength;
@@ -355,12 +351,12 @@ static dictItem ZDICT_analyzePos(
         /* mark positions done */
         {   U32 id;
             for (id=start; id<end; id++) {
-                U32 p, pEnd;
+                U32 p, pEnd, length;
                 U32 const testedPos = suffix[id];
                 if (testedPos == pos)
                     length = solution.length;
                 else {
-                    length = ZDICT_count(b+pos, b+testedPos);
+                    length = (U32)ZDICT_count(b+pos, b+testedPos);
                     if (length > solution.length) length = solution.length;
                 }
                 pEnd = (U32)(testedPos + length);
@@ -372,28 +368,43 @@ static dictItem ZDICT_analyzePos(
 }
 
 
-/*! ZDICT_checkMerge
+static int isIncluded(const void* in, const void* container, size_t length)
+{
+    const char* const ip = (const char*) in;
+    const char* const into = (const char*) container;
+    size_t u;
+
+    for (u=0; u<length; u++) {  /* works because end of buffer is a noisy guard band */
+        if (ip[u] != into[u]) break;
+    }
+
+    return u==length;
+}
+
+/*! ZDICT_tryMerge() :
     check if dictItem can be merged, do it if possible
     @return : id of destination elt, 0 if not merged
 */
-static U32 ZDICT_checkMerge(dictItem* table, dictItem elt, U32 eltNbToSkip)
+static U32 ZDICT_tryMerge(dictItem* table, dictItem elt, U32 eltNbToSkip, const void* buffer)
 {
     const U32 tableSize = table->pos;
-    const U32 max = elt.pos + (elt.length-1);
+    const U32 eltEnd = elt.pos + elt.length;
+    const char* const buf = (const char*) buffer;
 
     /* tail overlap */
     U32 u; for (u=1; u<tableSize; u++) {
         if (u==eltNbToSkip) continue;
-        if ((table[u].pos > elt.pos) && (table[u].pos < max)) {  /* overlap */
+        if ((table[u].pos > elt.pos) && (table[u].pos <= eltEnd)) {  /* overlap, existing > new */
             /* append */
-            U32 addedLength = table[u].pos - elt.pos;
+            U32 const addedLength = table[u].pos - elt.pos;
             table[u].length += addedLength;
             table[u].pos = elt.pos;
             table[u].savings += elt.savings * addedLength / elt.length;   /* rough approx */
-            table[u].savings += elt.length / 8;    /* rough approx */
+            table[u].savings += elt.length / 8;    /* rough approx bonus */
             elt = table[u];
+            /* sort : improve rank */
             while ((u>1) && (table[u-1].savings < elt.savings))
-                table[u] = table[u-1], u--;
+            table[u] = table[u-1], u--;
             table[u] = elt;
             return u;
     }   }
@@ -401,20 +412,33 @@ static U32 ZDICT_checkMerge(dictItem* table, dictItem elt, U32 eltNbToSkip)
     /* front overlap */
     for (u=1; u<tableSize; u++) {
         if (u==eltNbToSkip) continue;
-        if ((table[u].pos + table[u].length > elt.pos) && (table[u].pos < elt.pos)) {  /* overlap */
+
+        if ((table[u].pos + table[u].length >= elt.pos) && (table[u].pos < elt.pos)) {  /* overlap, existing < new */
             /* append */
-            int addedLength = (elt.pos + elt.length) - (table[u].pos + table[u].length);
-            table[u].savings += elt.length / 8;    /* rough approx */
-            if (addedLength > 0) {   /* otherwise, already included */
+            int const addedLength = (int)eltEnd - (table[u].pos + table[u].length);
+            table[u].savings += elt.length / 8;    /* rough approx bonus */
+            if (addedLength > 0) {   /* otherwise, elt fully included into existing */
                 table[u].length += addedLength;
                 table[u].savings += elt.savings * addedLength / elt.length;   /* rough approx */
             }
+            /* sort : improve rank */
             elt = table[u];
             while ((u>1) && (table[u-1].savings < elt.savings))
                 table[u] = table[u-1], u--;
             table[u] = elt;
             return u;
-    }   }
+        }
+
+        if (MEM_read64(buf + table[u].pos) == MEM_read64(buf + elt.pos + 1)) {
+            if (isIncluded(buf + table[u].pos, buf + elt.pos + 1, table[u].length)) {
+                size_t const addedLength = MAX( (int)elt.length - (int)table[u].length , 1 );
+                table[u].pos = elt.pos;
+                table[u].savings += (U32)(elt.savings * addedLength / elt.length);
+                table[u].length = MIN(elt.length, table[u].length + 1);
+                return u;
+            }
+        }
+    }
 
     return 0;
 }
@@ -422,8 +446,8 @@ static U32 ZDICT_checkMerge(dictItem* table, dictItem elt, U32 eltNbToSkip)
 
 static void ZDICT_removeDictItem(dictItem* table, U32 id)
 {
-    /* convention : first element is nb of elts */
-    U32 const max = table->pos;
+    /* convention : table[0].pos stores nb of elts */
+    U32 const max = table[0].pos;
     U32 u;
     if (!id) return;   /* protection, should never happen */
     for (u=id; u<max-1; u++)
@@ -432,14 +456,14 @@ static void ZDICT_removeDictItem(dictItem* table, U32 id)
 }
 
 
-static void ZDICT_insertDictItem(dictItem* table, U32 maxSize, dictItem elt)
+static void ZDICT_insertDictItem(dictItem* table, U32 maxSize, dictItem elt, const void* buffer)
 {
     /* merge if possible */
-    U32 mergeId = ZDICT_checkMerge(table, elt, 0);
+    U32 mergeId = ZDICT_tryMerge(table, elt, 0, buffer);
     if (mergeId) {
         U32 newMerge = 1;
         while (newMerge) {
-            newMerge = ZDICT_checkMerge(table, table[mergeId], mergeId);
+            newMerge = ZDICT_tryMerge(table, table[mergeId], mergeId, buffer);
             if (newMerge) ZDICT_removeDictItem(table, mergeId);
             mergeId = newMerge;
         }
@@ -470,10 +494,10 @@ static U32 ZDICT_dictSize(const dictItem* dictList)
 }
 
 
-static size_t ZDICT_trainBuffer(dictItem* dictList, U32 dictListSize,
+static size_t ZDICT_trainBuffer_legacy(dictItem* dictList, U32 dictListSize,
                             const void* const buffer, size_t bufferSize,   /* buffer must end with noisy guard band */
                             const size_t* fileSizes, unsigned nbFiles,
-                            U32 minRatio)
+                            unsigned minRatio, U32 notificationLevel)
 {
     int* const suffix0 = (int*)malloc((bufferSize+2)*sizeof(*suffix0));
     int* const suffix = suffix0+1;
@@ -481,6 +505,13 @@ static size_t ZDICT_trainBuffer(dictItem* dictList, U32 dictListSize,
     BYTE* doneMarks = (BYTE*)malloc((bufferSize+16)*sizeof(*doneMarks));   /* +16 for overflow security */
     U32* filePos = (U32*)malloc(nbFiles * sizeof(*filePos));
     size_t result = 0;
+    clock_t displayClock = 0;
+    clock_t const refreshRate = CLOCKS_PER_SEC * 3 / 10;
+
+#   define DISPLAYUPDATE(l, ...) if (notificationLevel>=l) { \
+            if (ZDICT_clockSpan(displayClock) > refreshRate)  \
+            { displayClock = clock(); DISPLAY(__VA_ARGS__); \
+            if (notificationLevel>=4) fflush(stderr); } }
 
     /* init */
     DISPLAYLEVEL(2, "\r%70s\r", "");   /* clean display line */
@@ -492,11 +523,11 @@ static size_t ZDICT_trainBuffer(dictItem* dictList, U32 dictListSize,
     memset(doneMarks, 0, bufferSize+16);
 
     /* limit sample set size (divsufsort limitation)*/
-    if (bufferSize > ZDICT_MAX_SAMPLES_SIZE) DISPLAYLEVEL(3, "sample set too large : reduced to %u MB ...\n", (U32)(ZDICT_MAX_SAMPLES_SIZE>>20));
+    if (bufferSize > ZDICT_MAX_SAMPLES_SIZE) DISPLAYLEVEL(3, "sample set too large : reduced to %u MB ...\n", (unsigned)(ZDICT_MAX_SAMPLES_SIZE>>20));
     while (bufferSize > ZDICT_MAX_SAMPLES_SIZE) bufferSize -= fileSizes[--nbFiles];
 
     /* sort */
-    DISPLAYLEVEL(2, "sorting %u files of total size %u MB ...\n", nbFiles, (U32)(bufferSize>>20));
+    DISPLAYLEVEL(2, "sorting %u files of total size %u MB ...\n", nbFiles, (unsigned)(bufferSize>>20));
     {   int const divSuftSortResult = divsufsort((const unsigned char*)buffer, suffix, (int)bufferSize, 0);
         if (divSuftSortResult != 0) { result = ERROR(GENERIC); goto _cleanup; }
     }
@@ -506,7 +537,8 @@ static size_t ZDICT_trainBuffer(dictItem* dictList, U32 dictListSize,
     {   size_t pos;
         for (pos=0; pos < bufferSize; pos++)
             reverseSuffix[suffix[pos]] = (U32)pos;
-        /* build file pos */
+        /* note filePos tracks borders between samples.
+           It's not used at this stage, but planned to become useful in a later update */
         filePos[0] = 0;
         for (pos=1; pos<nbFiles; pos++)
             filePos[pos] = (U32)(filePos[pos-1] + fileSizes[pos-1]);
@@ -518,9 +550,9 @@ static size_t ZDICT_trainBuffer(dictItem* dictList, U32 dictListSize,
     {   U32 cursor; for (cursor=0; cursor < bufferSize; ) {
             dictItem solution;
             if (doneMarks[cursor]) { cursor++; continue; }
-            solution = ZDICT_analyzePos(doneMarks, suffix, reverseSuffix[cursor], buffer, minRatio);
+            solution = ZDICT_analyzePos(doneMarks, suffix, reverseSuffix[cursor], buffer, minRatio, notificationLevel);
             if (solution.length==0) { cursor++; continue; }
-            ZDICT_insertDictItem(dictList, dictListSize, solution);
+            ZDICT_insertDictItem(dictList, dictListSize, solution, buffer);
             cursor += solution.length;
             DISPLAYUPDATE(2, "\r%4.2f %% \r", (double)cursor / bufferSize * 100);
     }   }
@@ -549,29 +581,31 @@ static void ZDICT_fillNoise(void* buffer, size_t length)
 
 typedef struct
 {
-    ZSTD_CCtx* ref;
-    ZSTD_CCtx* zc;
-    void* workPlace;   /* must be ZSTD_BLOCKSIZE_ABSOLUTEMAX allocated */
+    ZSTD_CDict* dict;    /* dictionary */
+    ZSTD_CCtx* zc;     /* working context */
+    void* workPlace;   /* must be ZSTD_BLOCKSIZE_MAX allocated */
 } EStats_ress_t;
 
 #define MAXREPOFFSET 1024
 
 static void ZDICT_countEStats(EStats_ress_t esr, ZSTD_parameters params,
-                            U32* countLit, U32* offsetcodeCount, U32* matchlengthCount, U32* litlengthCount, U32* repOffsets,
-                            const void* src, size_t srcSize)
+                              unsigned* countLit, unsigned* offsetcodeCount, unsigned* matchlengthCount, unsigned* litlengthCount, U32* repOffsets,
+                              const void* src, size_t srcSize,
+                              U32 notificationLevel)
 {
-    size_t const blockSizeMax = MIN (ZSTD_BLOCKSIZE_ABSOLUTEMAX, 1 << params.cParams.windowLog);
+    size_t const blockSizeMax = MIN (ZSTD_BLOCKSIZE_MAX, 1 << params.cParams.windowLog);
     size_t cSize;
 
     if (srcSize > blockSizeMax) srcSize = blockSizeMax;   /* protection vs large samples */
-	{	size_t const errorCode = ZSTD_copyCCtx(esr.zc, esr.ref);
-		if (ZSTD_isError(errorCode)) { DISPLAYLEVEL(1, "warning : ZSTD_copyCCtx failed \n"); return; }
-	}
-    cSize = ZSTD_compressBlock(esr.zc, esr.workPlace, ZSTD_BLOCKSIZE_ABSOLUTEMAX, src, srcSize);
-    if (ZSTD_isError(cSize)) { DISPLAYLEVEL(1, "warning : could not compress sample size %u \n", (U32)srcSize); return; }
+    {   size_t const errorCode = ZSTD_compressBegin_usingCDict(esr.zc, esr.dict);
+        if (ZSTD_isError(errorCode)) { DISPLAYLEVEL(1, "warning : ZSTD_compressBegin_usingCDict failed \n"); return; }
+
+    }
+    cSize = ZSTD_compressBlock(esr.zc, esr.workPlace, ZSTD_BLOCKSIZE_MAX, src, srcSize);
+    if (ZSTD_isError(cSize)) { DISPLAYLEVEL(3, "warning : could not compress sample size %u \n", (unsigned)srcSize); return; }
 
     if (cSize) {  /* if == 0; block is not compressible */
-        const seqStore_t* seqStorePtr = ZSTD_getSeqStore(esr.zc);
+        const seqStore_t* const seqStorePtr = ZSTD_getSeqStore(esr.zc);
 
         /* literals stats */
         {   const BYTE* bytePtr;
@@ -609,17 +643,6 @@ static void ZDICT_countEStats(EStats_ress_t esr, ZSTD_parameters params,
     }   }   }
 }
 
-/*
-static size_t ZDICT_maxSampleSize(const size_t* fileSizes, unsigned nbFiles)
-{
-    unsigned u;
-    size_t max=0;
-    for (u=0; u<nbFiles; u++)
-        if (max < fileSizes[u]) max = fileSizes[u];
-    return max;
-}
-*/
-
 static size_t ZDICT_totalSampleSize(const size_t* fileSizes, unsigned nbFiles)
 {
     size_t total=0;
@@ -644,25 +667,38 @@ static void ZDICT_insertSortCount(offsetCount_t table[ZSTD_REP_NUM+1], U32 val, 
     }
 }
 
+/* ZDICT_flatLit() :
+ * rewrite `countLit` to contain a mostly flat but still compressible distribution of literals.
+ * necessary to avoid generating a non-compressible distribution that HUF_writeCTable() cannot encode.
+ */
+static void ZDICT_flatLit(unsigned* countLit)
+{
+    int u;
+    for (u=1; u<256; u++) countLit[u] = 2;
+    countLit[0]   = 4;
+    countLit[253] = 1;
+    countLit[254] = 1;
+}
 
 #define OFFCODE_MAX 30  /* only applicable to first block */
 static size_t ZDICT_analyzeEntropy(void*  dstBuffer, size_t maxDstSize,
-                                 unsigned compressionLevel,
-                           const void*  srcBuffer, const size_t* fileSizes, unsigned nbFiles,
-                           const void* dictBuffer, size_t  dictBufferSize)
+                                   unsigned compressionLevel,
+                             const void*  srcBuffer, const size_t* fileSizes, unsigned nbFiles,
+                             const void* dictBuffer, size_t  dictBufferSize,
+                                   unsigned notificationLevel)
 {
-    U32 countLit[256];
+    unsigned countLit[256];
     HUF_CREATE_STATIC_CTABLE(hufTable, 255);
-    U32 offcodeCount[OFFCODE_MAX+1];
+    unsigned offcodeCount[OFFCODE_MAX+1];
     short offcodeNCount[OFFCODE_MAX+1];
     U32 offcodeMax = ZSTD_highbit32((U32)(dictBufferSize + 128 KB));
-    U32 matchLengthCount[MaxML+1];
+    unsigned matchLengthCount[MaxML+1];
     short matchLengthNCount[MaxML+1];
-    U32 litLengthCount[MaxLL+1];
+    unsigned litLengthCount[MaxLL+1];
     short litLengthNCount[MaxLL+1];
     U32 repOffset[MAXREPOFFSET];
     offsetCount_t bestRepOffset[ZSTD_REP_NUM+1];
-    EStats_ress_t esr;
+    EStats_ress_t esr = { NULL, NULL, NULL };
     ZSTD_parameters params;
     U32 u, huffLog = 11, Offlog = OffFSELog, mlLog = MLFSELog, llLog = LLFSELog, total;
     size_t pos = 0, errorCode;
@@ -672,47 +708,51 @@ static size_t ZDICT_analyzeEntropy(void*  dstBuffer, size_t maxDstSize,
     BYTE* dstPtr = (BYTE*)dstBuffer;
 
     /* init */
-    esr.ref = ZSTD_createCCtx();
+    DEBUGLOG(4, "ZDICT_analyzeEntropy");
+    if (offcodeMax>OFFCODE_MAX) { eSize = ERROR(dictionaryCreation_failed); goto _cleanup; }   /* too large dictionary */
+    for (u=0; u<256; u++) countLit[u] = 1;   /* any character must be described */
+    for (u=0; u<=offcodeMax; u++) offcodeCount[u] = 1;
+    for (u=0; u<=MaxML; u++) matchLengthCount[u] = 1;
+    for (u=0; u<=MaxLL; u++) litLengthCount[u] = 1;
+    memset(repOffset, 0, sizeof(repOffset));
+    repOffset[1] = repOffset[4] = repOffset[8] = 1;
+    memset(bestRepOffset, 0, sizeof(bestRepOffset));
+    if (compressionLevel==0) compressionLevel = g_compressionLevel_default;
+    params = ZSTD_getParams(compressionLevel, averageSampleSize, dictBufferSize);
+
+    esr.dict = ZSTD_createCDict_advanced(dictBuffer, dictBufferSize, ZSTD_dlm_byRef, ZSTD_dct_rawContent, params.cParams, ZSTD_defaultCMem);
     esr.zc = ZSTD_createCCtx();
-    esr.workPlace = malloc(ZSTD_BLOCKSIZE_ABSOLUTEMAX);
-    if (!esr.ref || !esr.zc || !esr.workPlace) {
+    esr.workPlace = malloc(ZSTD_BLOCKSIZE_MAX);
+    if (!esr.dict || !esr.zc || !esr.workPlace) {
         eSize = ERROR(memory_allocation);
         DISPLAYLEVEL(1, "Not enough memory \n");
         goto _cleanup;
     }
-    if (offcodeMax>OFFCODE_MAX) { eSize = ERROR(dictionary_wrong); goto _cleanup; }   /* too large dictionary */
-    for (u=0; u<256; u++) countLit[u]=1;   /* any character must be described */
-    for (u=0; u<=offcodeMax; u++) offcodeCount[u]=1;
-    for (u=0; u<=MaxML; u++) matchLengthCount[u]=1;
-    for (u=0; u<=MaxLL; u++) litLengthCount[u]=1;
-    memset(repOffset, 0, sizeof(repOffset));
-    repOffset[1] = repOffset[4] = repOffset[8] = 1;
-    memset(bestRepOffset, 0, sizeof(bestRepOffset));
-    if (compressionLevel==0) compressionLevel=g_compressionLevel_default;
-    params = ZSTD_getParams(compressionLevel, averageSampleSize, dictBufferSize);
-	{	size_t const beginResult = ZSTD_compressBegin_advanced(esr.ref, dictBuffer, dictBufferSize, params, 0);
-		if (ZSTD_isError(beginResult)) {
-			eSize = ERROR(GENERIC);
-			DISPLAYLEVEL(1, "error : ZSTD_compressBegin_advanced failed \n");
-			goto _cleanup;
-	}	}
 
-    /* collect stats on all files */
+    /* collect stats on all samples */
     for (u=0; u<nbFiles; u++) {
         ZDICT_countEStats(esr, params,
-                        countLit, offcodeCount, matchLengthCount, litLengthCount, repOffset,
-           (const char*)srcBuffer + pos, fileSizes[u]);
+                          countLit, offcodeCount, matchLengthCount, litLengthCount, repOffset,
+                         (const char*)srcBuffer + pos, fileSizes[u],
+                          notificationLevel);
         pos += fileSizes[u];
     }
 
-    /* analyze */
-    errorCode = HUF_buildCTable (hufTable, countLit, 255, huffLog);
-    if (HUF_isError(errorCode)) {
-        eSize = ERROR(GENERIC);
-        DISPLAYLEVEL(1, "HUF_buildCTable error \n");
-        goto _cleanup;
+    /* analyze, build stats, starting with literals */
+    {   size_t maxNbBits = HUF_buildCTable (hufTable, countLit, 255, huffLog);
+        if (HUF_isError(maxNbBits)) {
+            eSize = ERROR(GENERIC);
+            DISPLAYLEVEL(1, " HUF_buildCTable error \n");
+            goto _cleanup;
+        }
+        if (maxNbBits==8) {  /* not compressible : will fail on HUF_writeCTable() */
+            DISPLAYLEVEL(2, "warning : pathological dataset : literals are not compressible : samples are noisy or too regular \n");
+            ZDICT_flatLit(countLit);  /* replace distribution by a fake "mostly flat but still compressible" distribution, that HUF_writeCTable() can encode */
+            maxNbBits = HUF_buildCTable (hufTable, countLit, 255, huffLog);
+            assert(maxNbBits==9);
+        }
+        huffLog = (U32)maxNbBits;
     }
-    huffLog = (U32)errorCode;
 
     /* looking for most common first offsets */
     {   U32 offset;
@@ -747,7 +787,6 @@ static size_t ZDICT_analyzeEntropy(void*  dstBuffer, size_t maxDstSize,
         goto _cleanup;
     }
     llLog = (U32)errorCode;
-
 
     /* write result to buffer */
     {   size_t const hhSize = HUF_writeCTable(dstPtr, maxDstSize, hufTable, 255, huffLog);
@@ -810,11 +849,10 @@ static size_t ZDICT_analyzeEntropy(void*  dstBuffer, size_t maxDstSize,
     MEM_writeLE32(dstPtr+4, repStartValue[1]);
     MEM_writeLE32(dstPtr+8, repStartValue[2]);
 #endif
-    dstPtr += 12;
     eSize += 12;
 
 _cleanup:
-    ZSTD_freeCCtx(esr.ref);
+    ZSTD_freeCDict(esr.dict);
     ZSTD_freeCCtx(esr.zc);
     free(esr.workPlace);
 
@@ -822,48 +860,103 @@ _cleanup:
 }
 
 
-size_t ZDICT_addEntropyTablesFromBuffer_advanced(void* dictBuffer, size_t dictContentSize, size_t dictBufferCapacity,
-                                                 const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples,
-                                                 ZDICT_params_t params)
+
+size_t ZDICT_finalizeDictionary(void* dictBuffer, size_t dictBufferCapacity,
+                          const void* customDictContent, size_t dictContentSize,
+                          const void* samplesBuffer, const size_t* samplesSizes,
+                          unsigned nbSamples, ZDICT_params_t params)
 {
     size_t hSize;
-    int const compressionLevel = (params.compressionLevel <= 0) ? g_compressionLevel_default : params.compressionLevel;
+#define HBUFFSIZE 256   /* should prove large enough for all entropy headers */
+    BYTE header[HBUFFSIZE];
+    int const compressionLevel = (params.compressionLevel == 0) ? g_compressionLevel_default : params.compressionLevel;
+    U32 const notificationLevel = params.notificationLevel;
+
+    /* check conditions */
+    DEBUGLOG(4, "ZDICT_finalizeDictionary");
+    if (dictBufferCapacity < dictContentSize) return ERROR(dstSize_tooSmall);
+    if (dictContentSize < ZDICT_CONTENTSIZE_MIN) return ERROR(srcSize_wrong);
+    if (dictBufferCapacity < ZDICT_DICTSIZE_MIN) return ERROR(dstSize_tooSmall);
 
     /* dictionary header */
-    MEM_writeLE32(dictBuffer, ZSTD_DICT_MAGIC);
-    {   U64 const randomID = XXH64((char*)dictBuffer + dictBufferCapacity - dictContentSize, dictContentSize, 0);
+    MEM_writeLE32(header, ZSTD_MAGIC_DICTIONARY);
+    {   U64 const randomID = XXH64(customDictContent, dictContentSize, 0);
         U32 const compliantID = (randomID % ((1U<<31)-32768)) + 32768;
         U32 const dictID = params.dictID ? params.dictID : compliantID;
-        MEM_writeLE32((char*)dictBuffer+4, dictID);
+        MEM_writeLE32(header+4, dictID);
     }
     hSize = 8;
 
     /* entropy tables */
     DISPLAYLEVEL(2, "\r%70s\r", "");   /* clean display line */
     DISPLAYLEVEL(2, "statistics ... \n");
-    {   size_t const eSize = ZDICT_analyzeEntropy((char*)dictBuffer+hSize, dictBufferCapacity-hSize,
+    {   size_t const eSize = ZDICT_analyzeEntropy(header+hSize, HBUFFSIZE-hSize,
                                   compressionLevel,
                                   samplesBuffer, samplesSizes, nbSamples,
-                                  (char*)dictBuffer + dictBufferCapacity - dictContentSize, dictContentSize);
+                                  customDictContent, dictContentSize,
+                                  notificationLevel);
         if (ZDICT_isError(eSize)) return eSize;
         hSize += eSize;
     }
 
+    /* copy elements in final buffer ; note : src and dst buffer can overlap */
+    if (hSize + dictContentSize > dictBufferCapacity) dictContentSize = dictBufferCapacity - hSize;
+    {   size_t const dictSize = hSize + dictContentSize;
+        char* dictEnd = (char*)dictBuffer + dictSize;
+        memmove(dictEnd - dictContentSize, customDictContent, dictContentSize);
+        memcpy(dictBuffer, header, hSize);
+        return dictSize;
+    }
+}
+
+
+static size_t ZDICT_addEntropyTablesFromBuffer_advanced(
+        void* dictBuffer, size_t dictContentSize, size_t dictBufferCapacity,
+        const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples,
+        ZDICT_params_t params)
+{
+    int const compressionLevel = (params.compressionLevel == 0) ? g_compressionLevel_default : params.compressionLevel;
+    U32 const notificationLevel = params.notificationLevel;
+    size_t hSize = 8;
+
+    /* calculate entropy tables */
+    DISPLAYLEVEL(2, "\r%70s\r", "");   /* clean display line */
+    DISPLAYLEVEL(2, "statistics ... \n");
+    {   size_t const eSize = ZDICT_analyzeEntropy((char*)dictBuffer+hSize, dictBufferCapacity-hSize,
+                                  compressionLevel,
+                                  samplesBuffer, samplesSizes, nbSamples,
+                                  (char*)dictBuffer + dictBufferCapacity - dictContentSize, dictContentSize,
+                                  notificationLevel);
+        if (ZDICT_isError(eSize)) return eSize;
+        hSize += eSize;
+    }
+
+    /* add dictionary header (after entropy tables) */
+    MEM_writeLE32(dictBuffer, ZSTD_MAGIC_DICTIONARY);
+    {   U64 const randomID = XXH64((char*)dictBuffer + dictBufferCapacity - dictContentSize, dictContentSize, 0);
+        U32 const compliantID = (randomID % ((1U<<31)-32768)) + 32768;
+        U32 const dictID = params.dictID ? params.dictID : compliantID;
+        MEM_writeLE32((char*)dictBuffer+4, dictID);
+    }
 
     if (hSize + dictContentSize < dictBufferCapacity)
         memmove((char*)dictBuffer + hSize, (char*)dictBuffer + dictBufferCapacity - dictContentSize, dictContentSize);
     return MIN(dictBufferCapacity, hSize+dictContentSize);
 }
 
-
-/*! ZDICT_trainFromBuffer_unsafe() :
+/* Hidden declaration for dbio.c */
+size_t ZDICT_trainFromBuffer_unsafe_legacy(
+                            void* dictBuffer, size_t maxDictSize,
+                            const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples,
+                            ZDICT_legacy_params_t params);
+/*! ZDICT_trainFromBuffer_unsafe_legacy() :
 *   Warning : `samplesBuffer` must be followed by noisy guard band.
 *   @return : size of dictionary, or an error code which can be tested with ZDICT_isError()
 */
-size_t ZDICT_trainFromBuffer_unsafe(
+size_t ZDICT_trainFromBuffer_unsafe_legacy(
                             void* dictBuffer, size_t maxDictSize,
                             const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples,
-                            ZDICT_params_t params)
+                            ZDICT_legacy_params_t params)
 {
     U32 const dictListSize = MAX(MAX(DICTLISTSIZE_DEFAULT, nbSamples), (U32)(maxDictSize/16));
     dictItem* const dictList = (dictItem*)malloc(dictListSize * sizeof(*dictList));
@@ -872,58 +965,63 @@ size_t ZDICT_trainFromBuffer_unsafe(
     size_t const targetDictSize = maxDictSize;
     size_t const samplesBuffSize = ZDICT_totalSampleSize(samplesSizes, nbSamples);
     size_t dictSize = 0;
+    U32 const notificationLevel = params.zParams.notificationLevel;
 
     /* checks */
     if (!dictList) return ERROR(memory_allocation);
-    if (maxDictSize <= g_provision_entropySize + g_min_fast_dictContent) { free(dictList); return ERROR(dstSize_tooSmall); }
-    if (samplesBuffSize < ZDICT_MIN_SAMPLES_SIZE) { free(dictList); return 0; }   /* not enough source to create dictionary */
+    if (maxDictSize < ZDICT_DICTSIZE_MIN) { free(dictList); return ERROR(dstSize_tooSmall); }   /* requested dictionary size is too small */
+    if (samplesBuffSize < ZDICT_MIN_SAMPLES_SIZE) { free(dictList); return ERROR(dictionaryCreation_failed); }   /* not enough source to create dictionary */
 
     /* init */
     ZDICT_initDictItem(dictList);
-    g_displayLevel = params.notificationLevel;
 
     /* build dictionary */
-    ZDICT_trainBuffer(dictList, dictListSize,
-                    samplesBuffer, samplesBuffSize,
-                    samplesSizes, nbSamples,
-                    minRep);
+    ZDICT_trainBuffer_legacy(dictList, dictListSize,
+                       samplesBuffer, samplesBuffSize,
+                       samplesSizes, nbSamples,
+                       minRep, notificationLevel);
 
     /* display best matches */
-    if (g_displayLevel>= 3) {
-        U32 const nb = MIN(25, dictList[0].pos);
-        U32 const dictContentSize = ZDICT_dictSize(dictList);
-        U32 u;
-        DISPLAYLEVEL(3, "\n %u segments found, of total size %u \n", dictList[0].pos, dictContentSize);
-        DISPLAYLEVEL(3, "list %u best segments \n", nb);
-        for (u=1; u<=nb; u++) {
-            U32 pos = dictList[u].pos;
-            U32 length = dictList[u].length;
-            U32 printedLength = MIN(40, length);
+    if (params.zParams.notificationLevel>= 3) {
+        unsigned const nb = MIN(25, dictList[0].pos);
+        unsigned const dictContentSize = ZDICT_dictSize(dictList);
+        unsigned u;
+        DISPLAYLEVEL(3, "\n %u segments found, of total size %u \n", (unsigned)dictList[0].pos-1, dictContentSize);
+        DISPLAYLEVEL(3, "list %u best segments \n", nb-1);
+        for (u=1; u<nb; u++) {
+            unsigned const pos = dictList[u].pos;
+            unsigned const length = dictList[u].length;
+            U32 const printedLength = MIN(40, length);
+            if ((pos > samplesBuffSize) || ((pos + length) > samplesBuffSize)) {
+                free(dictList);
+                return ERROR(GENERIC);   /* should never happen */
+            }
             DISPLAYLEVEL(3, "%3u:%3u bytes at pos %8u, savings %7u bytes |",
-                         u, length, pos, dictList[u].savings);
-            ZDICT_printHex(3, (const char*)samplesBuffer+pos, printedLength);
+                         u, length, pos, (unsigned)dictList[u].savings);
+            ZDICT_printHex((const char*)samplesBuffer+pos, printedLength);
             DISPLAYLEVEL(3, "| \n");
     }   }
 
 
     /* create dictionary */
-    {   U32 dictContentSize = ZDICT_dictSize(dictList);
-        if (dictContentSize < targetDictSize/2) {
-            DISPLAYLEVEL(2, "!  warning : selected content significantly smaller than requested (%u < %u) \n", dictContentSize, (U32)maxDictSize);
+    {   unsigned dictContentSize = ZDICT_dictSize(dictList);
+        if (dictContentSize < ZDICT_CONTENTSIZE_MIN) { free(dictList); return ERROR(dictionaryCreation_failed); }   /* dictionary content too small */
+        if (dictContentSize < targetDictSize/4) {
+            DISPLAYLEVEL(2, "!  warning : selected content significantly smaller than requested (%u < %u) \n", dictContentSize, (unsigned)maxDictSize);
+            if (samplesBuffSize < 10 * targetDictSize)
+                DISPLAYLEVEL(2, "!  consider increasing the number of samples (total size : %u MB)\n", (unsigned)(samplesBuffSize>>20));
             if (minRep > MINRATIO) {
                 DISPLAYLEVEL(2, "!  consider increasing selectivity to produce larger dictionary (-s%u) \n", selectivity+1);
                 DISPLAYLEVEL(2, "!  note : larger dictionaries are not necessarily better, test its efficiency on samples \n");
             }
-            if (samplesBuffSize < 10 * targetDictSize)
-                DISPLAYLEVEL(2, "!  consider increasing the number of samples (total size : %u MB)\n", (U32)(samplesBuffSize>>20));
         }
 
-        if ((dictContentSize > targetDictSize*2) && (nbSamples > 2*MINRATIO) && (selectivity>1)) {
-            U32 proposedSelectivity = selectivity-1;
+        if ((dictContentSize > targetDictSize*3) && (nbSamples > 2*MINRATIO) && (selectivity>1)) {
+            unsigned proposedSelectivity = selectivity-1;
             while ((nbSamples >> proposedSelectivity) <= MINRATIO) { proposedSelectivity--; }
-            DISPLAYLEVEL(2, "!  note : calculated dictionary significantly larger than requested (%u > %u) \n", dictContentSize, (U32)maxDictSize);
-            DISPLAYLEVEL(2, "!  you may consider decreasing selectivity to produce denser dictionary (-s%u) \n", proposedSelectivity);
-            DISPLAYLEVEL(2, "!  but test its efficiency on samples \n");
+            DISPLAYLEVEL(2, "!  note : calculated dictionary significantly larger than requested (%u > %u) \n", dictContentSize, (unsigned)maxDictSize);
+            DISPLAYLEVEL(2, "!  consider increasing dictionary size, or produce denser dictionary (-s%u) \n", proposedSelectivity);
+            DISPLAYLEVEL(2, "!  always test dictionary efficiency on real samples \n");
         }
 
         /* limit dictionary size */
@@ -949,7 +1047,7 @@ size_t ZDICT_trainFromBuffer_unsafe(
 
         dictSize = ZDICT_addEntropyTablesFromBuffer_advanced(dictBuffer, dictContentSize, maxDictSize,
                                                              samplesBuffer, samplesSizes, nbSamples,
-                                                             params);
+                                                             params.zParams);
     }
 
     /* clean up */
@@ -958,11 +1056,12 @@ size_t ZDICT_trainFromBuffer_unsafe(
 }
 
 
-/* issue : samplesBuffer need to be followed by a noisy guard band.
-*  work around : duplicate the buffer, and add the noise */
-size_t ZDICT_trainFromBuffer_advanced(void* dictBuffer, size_t dictBufferCapacity,
-                                      const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples,
-                                      ZDICT_params_t params)
+/* ZDICT_trainFromBuffer_legacy() :
+ * issue : samplesBuffer need to be followed by a noisy guard band.
+ * work around : duplicate the buffer, and add the noise */
+size_t ZDICT_trainFromBuffer_legacy(void* dictBuffer, size_t dictBufferCapacity,
+                              const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples,
+                              ZDICT_legacy_params_t params)
 {
     size_t result;
     void* newBuff;
@@ -975,10 +1074,9 @@ size_t ZDICT_trainFromBuffer_advanced(void* dictBuffer, size_t dictBufferCapacit
     memcpy(newBuff, samplesBuffer, sBuffSize);
     ZDICT_fillNoise((char*)newBuff + sBuffSize, NOISELENGTH);   /* guard band, for end of buffer condition */
 
-    result = ZDICT_trainFromBuffer_unsafe(
-                                        dictBuffer, dictBufferCapacity,
-                                        newBuff, samplesSizes, nbSamples,
-                                        params);
+    result =
+        ZDICT_trainFromBuffer_unsafe_legacy(dictBuffer, dictBufferCapacity, newBuff,
+                                            samplesSizes, nbSamples, params);
     free(newBuff);
     return result;
 }
@@ -987,15 +1085,23 @@ size_t ZDICT_trainFromBuffer_advanced(void* dictBuffer, size_t dictBufferCapacit
 size_t ZDICT_trainFromBuffer(void* dictBuffer, size_t dictBufferCapacity,
                              const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples)
 {
-    ZDICT_params_t params;
+    ZDICT_fastCover_params_t params;
+    DEBUGLOG(3, "ZDICT_trainFromBuffer");
     memset(&params, 0, sizeof(params));
-    return ZDICT_trainFromBuffer_advanced(dictBuffer, dictBufferCapacity,
-                                          samplesBuffer, samplesSizes, nbSamples,
-                                          params);
+    params.d = 8;
+    params.steps = 4;
+    /* Default to level 6 since no compression level information is available */
+    params.zParams.compressionLevel = 3;
+#if defined(DEBUGLEVEL) && (DEBUGLEVEL>=1)
+    params.zParams.notificationLevel = DEBUGLEVEL;
+#endif
+    return ZDICT_optimizeTrainFromBuffer_fastCover(dictBuffer, dictBufferCapacity,
+                                               samplesBuffer, samplesSizes, nbSamples,
+                                               &params);
 }
 
 size_t ZDICT_addEntropyTablesFromBuffer(void* dictBuffer, size_t dictContentSize, size_t dictBufferCapacity,
-                                        const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples)
+                                  const void* samplesBuffer, const size_t* samplesSizes, unsigned nbSamples)
 {
     ZDICT_params_t params;
     memset(&params, 0, sizeof(params));

@@ -1,10 +1,11 @@
-/**
- * Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
+/*
+ * Copyright (c) 2015-present, Yann Collet, Facebook, Inc.
  * All rights reserved.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under both the BSD-style license (found in the
+ * LICENSE file in the root directory of this source tree) and the GPLv2 (found
+ * in the COPYING file in the root directory of this source tree).
+ * You may select, at your option, one of the above-listed licenses.
  */
 
 
@@ -23,16 +24,17 @@
 **************************************/
 #include <stdlib.h>       /* free */
 #include <stdio.h>        /* fgets, sscanf */
-#include <sys/timeb.h>    /* timeb */
 #include <string.h>       /* strcmp */
+#include "timefn.h"       /* UTIL_time_t */
 #include "mem.h"
 #define ZSTD_STATIC_LINKING_ONLY   /* ZSTD_maxCLevel */
 #include "zstd.h"         /* ZSTD_compressBound */
-#define ZBUFF_STATIC_LINKING_ONLY
-#include "zbuff.h"        /* ZBUFF_createCCtx_advanced */
+#define ZBUFF_STATIC_LINKING_ONLY  /* ZBUFF_createCCtx_advanced */
+#include "zbuff.h"        /* ZBUFF_isError */
 #include "datagen.h"      /* RDG_genBuffer */
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash.h"       /* XXH64_* */
+#include "util.h"
 
 
 /*-************************************
@@ -57,40 +59,24 @@ static const U32 prime2 = 2246822519U;
 #define DISPLAYLEVEL(l, ...)  if (g_displayLevel>=l) { DISPLAY(__VA_ARGS__); }
 static U32 g_displayLevel = 2;
 
-#define DISPLAYUPDATE(l, ...) if (g_displayLevel>=l) { \
-            if ((FUZ_GetMilliSpan(g_displayTime) > g_refreshRate) || (g_displayLevel>=4)) \
-            { g_displayTime = FUZ_GetMilliStart(); DISPLAY(__VA_ARGS__); \
-            if (g_displayLevel>=4) fflush(stdout); } }
-static const U32 g_refreshRate = 150;
-static U32 g_displayTime = 0;
+static const U64 g_refreshRate = SEC_TO_MICRO / 6;
+static UTIL_time_t g_displayClock = UTIL_TIME_INITIALIZER;
 
-static U32 g_testTime = 0;
+#define DISPLAYUPDATE(l, ...) if (g_displayLevel>=l) { \
+            if ((UTIL_clockSpanMicro(g_displayClock) > g_refreshRate) || (g_displayLevel>=4)) \
+            { g_displayClock = UTIL_getTime(); DISPLAY(__VA_ARGS__); \
+            if (g_displayLevel>=4) fflush(stderr); } }
+
+static U64 g_clockTime = 0;
 
 
 /*-*******************************************************
 *  Fuzzer functions
 *********************************************************/
+#undef MIN
+#undef MAX
+#define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
-
-static U32 FUZ_GetMilliStart(void)
-{
-    struct timeb tb;
-    U32 nCount;
-    ftime( &tb );
-    nCount = (U32) (((tb.time & 0xFFFFF) * 1000) +  tb.millitm);
-    return nCount;
-}
-
-
-static U32 FUZ_GetMilliSpan(U32 nTimeStart)
-{
-    U32 const nCurrent = FUZ_GetMilliStart();
-    U32 nSpan = nCurrent - nTimeStart;
-    if (nTimeStart > nCurrent)
-        nSpan += 0x100000 * 1000;
-    return nSpan;
-}
-
 /*! FUZ_rand() :
     @return : a 27 bits random value, from a 32-bits `seed`.
     `seed` is also modified */
@@ -269,8 +255,6 @@ static size_t FUZ_randomLength(U32* seed, U32 maxLog)
     return FUZ_rLogLength(seed, logLength);
 }
 
-#define MIN(a,b)   ( (a) < (b) ? (a) : (b) )
-
 #define CHECK(cond, ...) if (cond) { DISPLAY("Error => "); DISPLAY(__VA_ARGS__); \
                          DISPLAY(" (seed %u, test nb %u)  \n", seed, testNb); goto _output_error; }
 
@@ -279,11 +263,11 @@ static int fuzzerTests(U32 seed, U32 nbTests, unsigned startTest, double compres
     static const U32 maxSrcLog = 24;
     static const U32 maxSampleLog = 19;
     BYTE* cNoiseBuffer[5];
-    size_t srcBufferSize = (size_t)1<<maxSrcLog;
+    size_t const srcBufferSize = (size_t)1<<maxSrcLog;
     BYTE* copyBuffer;
-    size_t copyBufferSize= srcBufferSize + (1<<maxSampleLog);
+    size_t const copyBufferSize= srcBufferSize + (1<<maxSampleLog);
     BYTE* cBuffer;
-    size_t cBufferSize   = ZSTD_compressBound(srcBufferSize);
+    size_t const cBufferSize   = ZSTD_compressBound(srcBufferSize);
     BYTE* dstBuffer;
     size_t dstBufferSize = srcBufferSize;
     U32 result = 0;
@@ -291,7 +275,7 @@ static int fuzzerTests(U32 seed, U32 nbTests, unsigned startTest, double compres
     U32 coreSeed = seed;
     ZBUFF_CCtx* zc;
     ZBUFF_DCtx* zd;
-    U32 startTime = FUZ_GetMilliStart();
+    UTIL_time_t startClock = UTIL_getTime();
 
     /* allocations */
     zc = ZBUFF_createCCtx();
@@ -321,7 +305,7 @@ static int fuzzerTests(U32 seed, U32 nbTests, unsigned startTest, double compres
         FUZ_rand(&coreSeed);
 
     /* test loop */
-    for ( ; (testNb <= nbTests) || (FUZ_GetMilliSpan(startTime) < g_testTime) ; testNb++ ) {
+    for ( ; (testNb <= nbTests) || (UTIL_clockSpanMicro(startClock) < g_clockTime) ; testNb++ ) {
         U32 lseed;
         const BYTE* srcBuffer;
         const BYTE* dict;
@@ -370,7 +354,7 @@ static int fuzzerTests(U32 seed, U32 nbTests, unsigned startTest, double compres
             {   ZSTD_parameters params = ZSTD_getParams(cLevel, 0, dictSize);
                 params.fParams.checksumFlag = FUZ_rand(&lseed) & 1;
                 params.fParams.noDictIDFlag = FUZ_rand(&lseed) & 1;
-                {   size_t const initError = ZBUFF_compressInit_advanced(zc, dict, dictSize, params, 0);
+                {   size_t const initError = ZBUFF_compressInit_advanced(zc, dict, dictSize, params, ZSTD_CONTENTSIZE_UNKNOWN);
                     CHECK (ZBUFF_isError(initError),"init error : %s", ZBUFF_getErrorName(initError));
         }   }   }
 
@@ -543,7 +527,7 @@ int main(int argc, const char** argv)
 
                 case 'i':
                     argument++;
-                    nbTests=0; g_testTime=0;
+                    nbTests=0; g_clockTime=0;
                     while ((*argument>='0') && (*argument<='9')) {
                         nbTests *= 10;
                         nbTests += *argument - '0';
@@ -553,15 +537,15 @@ int main(int argc, const char** argv)
 
                 case 'T':
                     argument++;
-                    nbTests=0; g_testTime=0;
+                    nbTests=0; g_clockTime=0;
                     while ((*argument>='0') && (*argument<='9')) {
-                        g_testTime *= 10;
-                        g_testTime += *argument - '0';
+                        g_clockTime *= 10;
+                        g_clockTime += *argument - '0';
                         argument++;
                     }
-                    if (*argument=='m') g_testTime *=60, argument++;
+                    if (*argument=='m') g_clockTime *=60, argument++;
                     if (*argument=='n') argument++;
-                    g_testTime *= 1000;
+                    g_clockTime *= SEC_TO_MICRO;
                     break;
 
                 case 's':
@@ -605,7 +589,11 @@ int main(int argc, const char** argv)
     /* Get Seed */
     DISPLAY("Starting zstd_buffered tester (%i-bits, %s)\n", (int)(sizeof(size_t)*8), ZSTD_VERSION_STRING);
 
-    if (!seedset) seed = FUZ_GetMilliStart() % 10000;
+    if (!seedset) {
+        time_t const t = time(NULL);
+        U32 const h = XXH32(&t, sizeof(t), 1);
+        seed = h % 10000;
+    }
     DISPLAY("Seed = %u\n", seed);
     if (proba!=FUZ_COMPRESSIBILITY_DEFAULT) DISPLAY("Compressibility : %i%%\n", proba);
 
