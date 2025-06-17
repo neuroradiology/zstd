@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -56,6 +56,7 @@ static int testSimpleAPI(void)
             } else {
                 DISPLAY("ERROR: %s\n", ZSTD_getErrorName(ret));
             }
+            free(output);
             return 1;
         }
         if (ret != size) {
@@ -64,6 +65,7 @@ static int testSimpleAPI(void)
     }
     if (memcmp(EXPECTED, output, size) != 0) {
         DISPLAY("ERROR: Wrong decoded output produced\n");
+        free(output);
         return 1;
     }
 

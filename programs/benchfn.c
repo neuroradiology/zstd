@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -15,7 +15,6 @@
 ***************************************/
 #include <stdlib.h>      /* malloc, free */
 #include <string.h>      /* memset */
-#undef NDEBUG            /* assert must not be disabled */
 #include <assert.h>      /* assert */
 
 #include "timefn.h"        /* UTIL_time_t, UTIL_getTime */
@@ -54,6 +53,9 @@
     return retValue;                                  \
 }
 
+/* Abort execution if a condition is not met */
+#define CONTROL(c) { if (!(c)) { DEBUGOUTPUT("error: %s \n", #c); abort(); } }
+
 
 /* *************************************
 *  Benchmarking an arbitrary function
@@ -68,13 +70,13 @@ int BMK_isSuccessful_runOutcome(BMK_runOutcome_t outcome)
  *           check outcome validity first, using BMK_isValid_runResult() */
 BMK_runTime_t BMK_extract_runTime(BMK_runOutcome_t outcome)
 {
-    assert(outcome.error_tag_never_ever_use_directly == 0);
+    CONTROL(outcome.error_tag_never_ever_use_directly == 0);
     return outcome.internal_never_ever_use_directly;
 }
 
 size_t BMK_extract_errorResult(BMK_runOutcome_t outcome)
 {
-    assert(outcome.error_tag_never_ever_use_directly != 0);
+    CONTROL(outcome.error_tag_never_ever_use_directly != 0);
     return outcome.error_result_never_ever_use_directly;
 }
 
@@ -106,7 +108,6 @@ static BMK_runOutcome_t BMK_setValid_runTime(BMK_runTime_t runTime)
 BMK_runOutcome_t BMK_benchFunction(BMK_benchParams_t p,
                                    unsigned nbLoops)
 {
-    size_t dstSize = 0;
     nbLoops += !nbLoops;   /* minimum nbLoops is 1 */
 
     /* init */
@@ -116,7 +117,8 @@ BMK_runOutcome_t BMK_benchFunction(BMK_benchParams_t p,
     }   }
 
     /* benchmark */
-    {   UTIL_time_t const clockStart = UTIL_getTime();
+    {   size_t dstSize = 0;
+        UTIL_time_t const clockStart = UTIL_getTime();
         unsigned loopNb, blockNb;
         if (p.initFn != NULL) p.initFn(p.initPayload);
         for (loopNb = 0; loopNb < nbLoops; loopNb++) {
@@ -227,9 +229,9 @@ BMK_runOutcome_t BMK_benchTimedFn(BMK_timedFnState_t* cont,
             cont->timeSpent_ns += (unsigned long long)loopDuration_ns;
 
             /* estimate nbLoops for next run to last approximately 1 second */
-            if (loopDuration_ns > (runBudget_ns / 50)) {
+            if (loopDuration_ns > ((double)runBudget_ns / 50)) {
                 double const fastestRun_ns = MIN(bestRunTime.nanoSecPerRun, newRunTime.nanoSecPerRun);
-                cont->nbLoops = (unsigned)(runBudget_ns / fastestRun_ns) + 1;
+                cont->nbLoops = (unsigned)((double)runBudget_ns / fastestRun_ns) + 1;
             } else {
                 /* previous run was too short : blindly increase workload by x multiplier */
                 const unsigned multiplier = 10;
@@ -237,7 +239,7 @@ BMK_runOutcome_t BMK_benchTimedFn(BMK_timedFnState_t* cont,
                 cont->nbLoops *= multiplier;
             }
 
-            if(loopDuration_ns < runTimeMin_ns) {
+            if(loopDuration_ns < (double)runTimeMin_ns) {
                 /* don't report results for which benchmark run time was too small : increased risks of rounding errors */
                 assert(completed == 0);
                 continue;
